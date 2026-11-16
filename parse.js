@@ -928,12 +928,13 @@ function isBlank(s) {
 }
 
 // Columns of leading whitespace (space=1, tab=to next multiple of 4).
-function indentOf(s) {
+function indentOf(s, col0) {
+  col0 = col0 || 0;
   let col = 0;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (c === ' ') col++;
-    else if (c === '\t') col += 4 - (col % 4);
+    else if (c === '\t') col += 4 - ((col0 + col) % 4);
     else break;
   }
   return col;
@@ -959,13 +960,14 @@ function stripContentIndent(line, lead, markerWidth, contentIndent) {
 
 // Remove `n` columns of leading indent; a tab straddling the boundary
 // becomes the spaces that remain.
-function stripIndent(s, n) {
+function stripIndent(s, n, col0) {
+  col0 = col0 || 0;
   let col = 0, i = 0;
   while (i < s.length && col < n) {
     const c = s[i];
     if (c === ' ') { col++; i++; }
     else if (c === '\t') {
-      const w = 4 - (col % 4);
+      const w = 4 - ((col0 + col) % 4);
       if (col + w <= n) { col += w; i++; }
       else return ' '.repeat(col + w - n) + s.slice(i + 1);
     } else break;
@@ -1005,16 +1007,20 @@ function closeAbove(stack, d) {
 function finalizeLeaf(leaf) {
   leaf.open = false;
   if (leaf.t === 'para') {
-    // trim trailing blank lines (they are separators, not content)
-    while (leaf.lines.length > 0 && isBlank(leaf.lines[leaf.lines.length - 1])) leaf.lines.pop();
+    // trim trailing exactly-empty lines (they are separators, not
+    // content); a whitespace-only last line (e.g. a single space from
+    // a trailing `> ` line) is content and is kept
+    while (leaf.lines.length > 0 && leaf.lines[leaf.lines.length - 1] === '') leaf.lines.pop();
   }
   if (leaf.t === 'icode') {
     while (leaf.lines.length > 0 && isBlank(leaf.lines[leaf.lines.length - 1])) leaf.lines.pop();
   }
   if (leaf.t === 'fcode') {
-    // strip trailing exactly-empty lines (a whitespace-only last line
-    // is content and is kept)
-    while (leaf.lines.length > 0 && leaf.lines[leaf.lines.length - 1] === '') leaf.lines.pop();
+    // strip exactly one trailing exactly-empty line: the blank line
+    // immediately before a closing fence (or at EOF) is not content,
+    // but earlier blank lines are. A whitespace-only last line is
+    // content and is kept.
+    if (leaf.lines.length > 0 && leaf.lines[leaf.lines.length - 1] === '') leaf.lines.pop();
   }
 }
 
@@ -1027,9 +1033,17 @@ function finalizeContainer(node) {
 }
 
 // Mark every open container in the stack as having seen a blank line (for
-// list tight/loose detection).
+// list tight/loose detection). A blank inside a blockquote (or other child
+// block) of an item is not a separator between items of the enclosing
+// list, so it does not set the list entry's flag (the list branch uses
+// that flag to detect a blank between two items).
 function markBlank(stack) {
-  for (const c of stack) c.blank = true;
+  const deepest = stack[stack.length - 1];
+  const deepInBlock = deepest && deepest.node && deepest.node.t === 'bq';
+  for (const c of stack) {
+    if (deepInBlock && c.node && c.node.t === 'list') continue;
+    c.blank = true;
+  }
 }
 
 // ---- block-start detectors ------------------------------------------------
@@ -1330,7 +1344,7 @@ function listMarker(s) {
 function stripThrough(line, stack) {
   let rest = line;
   for (let k = 1; k < stack.length; k++) {
-    const r = stack[k].match(rest);
+    const r = stack[k].match(rest, 0);
     if (r === null) return null;
     rest = r;
   }
@@ -1348,13 +1362,14 @@ function buildTree(lines, defs, endsWithNL) {
     // sees the fully stripped blank line). A line that is blank from the
     // start only matches a container whose match accepts it (a blockquote
     // needs its `>`; a list accepts a blank line; an item needs indent).
-    let rest = raw, d = 0;
+    let rest = raw, d = 0, col = 0;
     const rawBlank = isBlank(raw);
     for (let k = 1; k < stack.length; k++) {
       if (isBlank(rest) && !rawBlank) { d = k; continue; }
-      const r = stack[k].match(rest);
+      const r = stack[k].match(rest, col);
       if (r === null) break;
       rest = r; d = k;
+      col += stack[k].lastStrip || 0;
     }
     if (d < stack.length - 1) {
       // a fenced code block swallows its content lines even when they
@@ -1392,6 +1407,11 @@ function buildTree(lines, defs, endsWithNL) {
             } else if (indentOf(line) >= 4) {
               line = stripIndent(line, 4);
             }
+          } else if (stack[stack.length - 1].node.t === 'item') {
+            // a lazy line in a list item that is indented by 4+ columns
+            // (e.g. a list marker not indented enough to nest) has 4
+            // columns stripped
+            if (indentOf(line, col) >= 4) line = stripIndent(line, 4, col);
           }
           leaf.lines.push(line);
           leaf.lastLazy = true;
@@ -1414,11 +1434,11 @@ function buildTree(lines, defs, endsWithNL) {
           if (isClosingFence(cur, leaf.fence)) finalizeLeaf(leaf);
           // up to N spaces of indentation are removed from each content
           // line, where N is the leading fence's indent
-          else leaf.lines.push(stripIndent(cur, leaf.indent || 0));
+          else leaf.lines.push(stripIndent(cur, leaf.indent || 0, col));
           handled = true;
         } else if (leaf.t === 'icode') {
-          if (isBlank(cur)) { leaf.lines.push(stripIndent(cur, 4)); handled = true; }
-          else if (indentOf(cur) >= 4) { leaf.lines.push(stripIndent(cur, 4)); handled = true; }
+          if (isBlank(cur)) { leaf.lines.push(stripIndent(cur, 4, col)); handled = true; }
+          else if (indentOf(cur, col) >= 4) { leaf.lines.push(stripIndent(cur, 4, col)); handled = true; }
           else finalizeLeaf(leaf); // fall through to new-block logic
         } else if (leaf.t === 'html') {
           if (leaf.endsAtBlank && isBlank(cur)) {
@@ -1438,7 +1458,20 @@ function buildTree(lines, defs, endsWithNL) {
             handled = true;
           }
         } else if (leaf.t === 'para') {
-          if (isBlank(cur)) { finalizeLeaf(leaf); markBlank(stack); handled = true; }
+          if (isBlank(cur)) {
+            // a line that is blank only after stripping a container
+            // marker (e.g. `> ` with a trailing space) contributes its
+            // whitespace to the paragraph when nothing follows it in
+            // this container; otherwise it is a blank separator
+            if (cur !== '' && !isBlank(raw)) {
+              const nx = lines[i + 1];
+              const st = nx === undefined ? null : stripThrough(nx, stack);
+              if (nx === undefined || st === null || isBlank(st)) {
+                leaf.lines.push(cur);
+                handled = true;
+              } else { finalizeLeaf(leaf); markBlank(stack); handled = true; }
+            } else { finalizeLeaf(leaf); markBlank(stack); handled = true; }
+          }
           else {
             const se = isSetextLine(cur);
             if (se) {
@@ -1483,7 +1516,11 @@ function buildTree(lines, defs, endsWithNL) {
           else { leaf.rows.push(cur); handled = true; }
         }
       } else if (isBlank(cur)) {
-        markBlank(stack);
+        // only a line that is blank in the source is a real blank line
+        // for loose/tight purposes; a line that became blank only by
+        // stripping a container marker (e.g. an empty `>` line) is not
+        // a separator for outer containers
+        if (rawBlank) markBlank(stack);
         handled = true;
       }
       if (!handled) {
@@ -1497,9 +1534,9 @@ function buildTree(lines, defs, endsWithNL) {
           closeAbove(stack, stack.length - 2);
           continue;
         }
-        const r = startNewBlock(cur, stack, lines, i, defs, endsWithNL);
+        const r = startNewBlock(cur, stack, lines, i, defs, endsWithNL, col);
         if (r.extra) { extraLines = r.extra; handled = true; }
-        else if (r.cur !== undefined) { cur = r.cur; }
+        else if (r.cur !== undefined) { cur = r.cur; if (r.col !== undefined) col = r.col; }
         else handled = true;
       }
     }
@@ -1513,19 +1550,23 @@ function buildTree(lines, defs, endsWithNL) {
 // {extra} when the line is consumed (extra = further lines consumed, e.g.
 // by a link definition), {cur} when a container was opened and the
 // remainder must be reprocessed, or {} when the line is consumed.
-function startNewBlock(cur, stack, lines, i, defs, endsWithNL) {
+function startNewBlock(cur, stack, lines, i, defs, endsWithNL, col) {
+  col = col || 0;
   const cont = stack[stack.length - 1];
   const node = cont.node;
   // A blank line seen since the last block started in this container makes
-  // the enclosing list loose when a new block starts after it.
+  // the enclosing list loose when a new block starts after it. The blank
+  // is consumed by this block start: it must not also make an outer
+  // list loose (a blank deep inside a nested list does not loosen the
+  // outer list), so clear the flag on every open container.
   const noteBlank = () => {
     if (cont.blank && node.children.length > 0 && node.t === 'item' && node.list) node.list.loose = true;
-    cont.blank = false;
+    for (const e of stack) e.blank = false;
   };
   // indented code
-  if (indentOf(cur) >= 4) {
+  if (indentOf(cur, col) >= 4) {
     noteBlank();
-    node.children.push({ t: 'icode', lines: [stripIndent(cur, 4)], open: true });
+    node.children.push({ t: 'icode', lines: [stripIndent(cur, 4, col)], open: true });
     return {};
   }
   const s = stripUpTo3(cur);
@@ -1592,25 +1633,39 @@ function startNewBlock(cur, stack, lines, i, defs, endsWithNL) {
   if (s[0] === '>') {
     noteBlank();
     let r = s.slice(1);
-    if (r[0] === ' ') r = r.slice(1);
+    let stripped = (cur.length - s.length) + 1;
+    if (r[0] === ' ') { r = r.slice(1); stripped++; }
+    else if (r[0] === '\t') {
+      // a tab after '>' is expanded to spaces and one column is
+      // consumed as the optional space after the marker
+      const tabCol = col + stripped;
+      const w = 4 - (tabCol % 4);
+      r = ' '.repeat(w - 1) + r.slice(1);
+      stripped++;
+    }
     const bq = { t: 'bq', children: [], open: true };
     node.children.push(bq);
-    stack.push({ node: bq, match: (line) => {
+    const bqEntryObj = { node: bq, match: null, blank: false };
+    bqEntryObj.match = (line, col) => {
       const t2 = stripUpTo3(line);
       if (t2[0] !== '>') return null;
       let rr = t2.slice(1);
       // column of rr[0] in the original line
-      let col = (line.length - t2.length) + 1;
-      if (rr[0] === ' ') { rr = rr.slice(1); col++; }
+      let c2 = (line.length - t2.length) + 1;
+      if (rr[0] === ' ') { rr = rr.slice(1); c2++; }
       // a tab right after '>' (or after the optional space) expands to
-      // spaces measured from its column
-      if (rr[0] === '\t') {
-        const w = 4 - (col % 4);
-        rr = ' '.repeat(w) + rr.slice(1);
+      // spaces and one column is consumed as the optional space
+      else if (rr[0] === '\t') {
+        const w = 4 - ((col + c2) % 4);
+        rr = ' '.repeat(w - 1) + rr.slice(1);
+        c2++;
       }
+      // columns stripped: up to 3 spaces + '>' + optional 1 space
+      bqEntryObj.lastStrip = c2;
       return rr;
-    }, blank: false });
-    return { cur: r };
+    };
+    stack.push(bqEntryObj);
+    return { cur: r, col: col + stripped };
   }
   // list
   const m = listMarker(cur);
@@ -1629,7 +1684,7 @@ function startNewBlock(cur, stack, lines, i, defs, endsWithNL) {
       kids.push(list);
       const listNode = list;
       const listEntryObj = { node: list, match: null, blank: false };
-      listEntryObj.match = (line) => {
+      listEntryObj.match = (line, col) => {
         if (isBlank(line)) return line;
         const items = listNode.children;
         if (items.length > 0) {
@@ -1638,7 +1693,8 @@ function startNewBlock(cur, stack, lines, i, defs, endsWithNL) {
           // an empty item cannot be continued after a blank line: the
           // blank line ends it, so a following indented line is a new
           // block outside the list
-          if (!(lastItem.children.length === 0 && listEntryObj.blank) && indentOf(line) >= ci) return line;
+          const ind = indentOf(line, col);
+          if (!(lastItem.children.length === 0 && listEntryObj.blank) && (ind >= ci || (!listEntryObj.blank && ind >= 4))) return line;
         }
         const mm = listMarker(line);
         if (mm && mm.ordered === listNode.ordered &&
@@ -1655,18 +1711,35 @@ function startNewBlock(cur, stack, lines, i, defs, endsWithNL) {
     list.children.push(item);
     const ci = m.contentIndent;
     const itemEntryObj = { node: item, match: null, blank: false };
-    itemEntryObj.match = (line) => {
+    itemEntryObj.match = (line, col) => {
       // a blank line never closes a list item (it only makes the list
       // loose); the item is closed by the next non-matching line.
       // Exception: an empty item is ended by a blank line, so a
       // following indented line cannot continue it.
-      if (isBlank(line)) return line;
+      if (isBlank(line)) { itemEntryObj.lastStrip = 0; return line; }
       if (item.children.length === 0 && itemEntryObj.blank) return null;
-      if (indentOf(line) >= ci) {
-        const r = stripIndent(line, ci);
+      const ind = indentOf(line, col);
+      if (ind >= ci) {
+        const r = stripIndent(line, ci, col);
+        itemEntryObj.lastStrip = ci;
         // a tab starting exactly at the content-indent boundary expands
         // to spaces (its width from this column)
-        if (r[0] === '\t') return ' '.repeat(4 - (ci % 4)) + r.slice(1);
+        if (r[0] === '\t') return ' '.repeat(4 - ((col + ci) % 4)) + r.slice(1);
+        return r;
+      }
+      // a line indented by 4+ spaces also belongs to the item (it is
+      // "indented" content); only 4 columns are stripped, not the full
+      // content indent. This applies only to a lazy paragraph
+      // continuation (no blank line before it); after a blank line the
+      // line must meet the full content indent to stay in the item.
+      // A list marker is not stripped here: it is a lazy continuation
+      // of the paragraph (the marker is not indented enough to open a
+      // nested list), handled by the lazy branch below.
+      if (!itemEntryObj.blank && ind >= 4) {
+        const r = stripIndent(line, 4, col);
+        if (listMarker(r)) return null;
+        itemEntryObj.lastStrip = 4;
+        if (r[0] === '\t') return ' '.repeat(4 - ((col + 4) % 4)) + r.slice(1);
         return r;
       }
       return null;
@@ -1686,7 +1759,7 @@ function startNewBlock(cur, stack, lines, i, defs, endsWithNL) {
       }
     }
     if (isBlank(rem)) return {};
-    return { cur: rem };
+    return { cur: rem, col: col + ci };
   }
   // paragraph
   noteBlank();
