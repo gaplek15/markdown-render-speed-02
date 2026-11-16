@@ -1104,18 +1104,8 @@ function finalizeContainer(node) {
 function markBlank(stack) {
   const deepest = stack[stack.length - 1];
   const deepInBlock = deepest && deepest.node && deepest.node.t === 'bq';
-  // a blank inside a nested list does not loosen an outer list: only
-  // the innermost list gets the blank flag (item entries are still
-  // marked, so a following block that lands in an outer item can
-  // loosen that item's list via noteBlank)
-  let deepestListIdx = -1;
-  for (let k = stack.length - 1; k >= 0; k--) {
-    if (stack[k].node && stack[k].node.t === 'list') { deepestListIdx = k; break; }
-  }
-  for (let k = 0; k < stack.length; k++) {
-    const c = stack[k];
+  for (const c of stack) {
     if (deepInBlock && c.node && c.node.t === 'list') continue;
-    if (c.node && c.node.t === 'list' && k < deepestListIdx) continue;
     c.blank = true;
   }
 }
