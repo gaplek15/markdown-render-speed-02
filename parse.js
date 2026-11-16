@@ -10,6 +10,21 @@ function isPunct(ch) { return ch !== '' && PUNCT.indexOf(ch) >= 0; }
 function isSpace(ch) { return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v'; }
 function isAlphaNum(ch) { const c = ch.charCodeAt(0); return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122); }
 
+// Fast ASCII char-class lookup: a Uint8Array indexed by char code. Replaces
+// per-character regex tests in the hot inline loop (a regex .test() on one
+// character is far slower than a table lookup).
+function charTable(chars) {
+  const t = new Uint8Array(128);
+  for (let k = 0; k < chars.length; k++) t[chars.charCodeAt(k)] = 1;
+  return t;
+}
+const EMAIL_LOCAL = charTable("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.!#$%&'*+/=?^_`{|}~-");
+const DOMAIN_CH = charTable('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-');
+const PATH_CH = charTable("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:/?#@!$'()*+,;=%");
+const SCHEME_CH = charTable('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-');
+const LABEL_CH = charTable('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-');
+const PATHSEG_CH = charTable("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:!$&'()*+,;=%@");
+
 // Escape text for HTML: & < > " '  (marked's escape set). A '&' that starts
 // an entity reference (&word; / &#digits; / &#x hex;) is left unescaped
 // (marked's escapeNoEncode) — named references pass through verbatim.
@@ -296,8 +311,10 @@ function parseInlineHtml(s, i) {
   let j = i + 1;
   let closing = false;
   if (s[j] === '/') { closing = true; j++; }
-  if (j >= n || !/[A-Za-z]/.test(s[j])) return null;
-  while (j < n && /[A-Za-z0-9-]/.test(s[j])) j++;
+  if (j >= n) return null;
+  const tc0 = s.charCodeAt(j);
+  if (!((tc0 >= 65 && tc0 <= 90) || (tc0 >= 97 && tc0 <= 122))) return null;
+  while (j < n && LABEL_CH[s.charCodeAt(j)]) j++;
   // a closing tag takes no attributes: only whitespace then '>'
   if (closing) {
     while (j < n && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n')) j++;
@@ -538,7 +555,7 @@ function parseWwwAutolink(s, i) {
   let labels = 0, hasDot = false;
   while (j < n) {
     const st = j;
-    while (j < n && /[A-Za-z0-9-]/.test(s[j])) j++;
+    while (j < n && LABEL_CH[s.charCodeAt(j)]) j++;
     if (j === st) break;
     labels++;
     if (j < n && s[j] === '.') { hasDot = true; j++; continue; }
@@ -557,14 +574,14 @@ function parseWwwAutolink(s, i) {
 function parseEmailAutolink(s, i) {
   const n = s.length;
   let j = i;
-  while (j < n && /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(s[j])) j++;
+  while (j < n && EMAIL_LOCAL[s.charCodeAt(j)]) j++;
   if (j === i || j >= n || s[j] !== '@') return null;
   // local part must not start/end with '.' and no '..'
   const local = s.slice(i, j);
   if (local[0] === '.' || local[local.length - 1] === '.' || local.indexOf('..') >= 0) return null;
   let k = j + 1;
   const dstart = k;
-  while (k < n && /[A-Za-z0-9.-]/.test(s[k])) k++;
+  while (k < n && DOMAIN_CH[s.charCodeAt(k)]) k++;
   // a '_' right after the domain means the word continues: not an email
   if (k < n && s[k] === '_') return null;
   let dom = s.slice(dstart, k);
@@ -595,7 +612,7 @@ function scanAutolinkPath(s, i) {
       let j = k + 1;
       if (j < n && s[j] !== '#') {
         const st = j;
-        while (j < n && /[A-Za-z0-9]/.test(s[j])) j++;
+        while (j < n && isAlphaNum(s[j])) j++;
         if (j > st && j < n && s[j] === ';') {
           const name = s.slice(st, j);
           if (name !== 'amp') return k;
@@ -603,7 +620,7 @@ function scanAutolinkPath(s, i) {
       }
       k++; continue;
     }
-    if (/[A-Za-z0-9\-._~:\/?#@!$'()*+,;=%]/.test(c)) { k++; continue; }
+    if (PATH_CH[s.charCodeAt(k)]) { k++; continue; }
     break;
   }
   return k;
@@ -615,9 +632,10 @@ function scanAutolinkPath(s, i) {
 // an email address with an optional single /resource (mailto:/xmpp:).
 function parseSchemeAutolink(s, i) {
   const n = s.length;
-  if (!/[A-Za-z]/.test(s[i])) return null;
+  const c0 = s.charCodeAt(i);
+  if (!((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))) return null;
   let j = i + 1;
-  while (j < n && /[A-Za-z0-9+.-]/.test(s[j])) j++;
+  while (j < n && SCHEME_CH[s.charCodeAt(j)]) j++;
   const schemeLen = j - i;
   if (schemeLen < 2 || schemeLen > 32) return null;
   if (j >= n || s[j] !== ':') return null;
@@ -629,12 +647,12 @@ function parseSchemeAutolink(s, i) {
     let labels = 0;
     while (k < n) {
       const st = k;
-      while (k < n && /[A-Za-z0-9-]/.test(s[k])) k++;
+      while (k < n && LABEL_CH[s.charCodeAt(k)]) k++;
       if (k === st) break;
       labels++;
       if (k < n && s[k] === '.') {
         // a '.' only continues the domain if another label follows
-        if (k + 1 < n && /[A-Za-z0-9-]/.test(s[k + 1])) { k++; continue; }
+        if (k + 1 < n && LABEL_CH[s.charCodeAt(k + 1)]) { k++; continue; }
         break;
       }
       break;
@@ -655,7 +673,7 @@ function parseSchemeAutolink(s, i) {
   if (end < n && s[end] === '/') {
     let k = end + 1;
     const st = k;
-    while (k < n && /[A-Za-z0-9\-._~:!$&'()*+,;=%@]/.test(s[k])) k++;
+    while (k < n && PATHSEG_CH[s.charCodeAt(k)]) k++;
     if (k > st) {
       const seg = trimAutolinkEnd(s.slice(end, k));
       if (seg.length > 1) end = end + seg.length;
@@ -788,10 +806,11 @@ function parseInline(s, defs, noLink) {
         }
       }
     }
-    if (!noLink && /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(c)) {
+    if (!noLink && EMAIL_LOCAL[c.charCodeAt(0)]) {
       // scheme autolink (http://, mailto:, xmpp:, ...) at a word start:
       // try it before the bare email, so `mailto:foo@bar.baz` links whole
-      if (/[A-Za-z]/.test(c)) {
+      const cc = c.charCodeAt(0);
+      if ((cc >= 65 && cc <= 90) || (cc >= 97 && cc <= 122)) {
         const prev = i > 0 ? s[i - 1] : '';
         if (prev === '' || isUnicodeWs(prev) || isUnicodePunct(prev)) {
           const sc = parseSchemeAutolink(s, i);
@@ -1230,14 +1249,16 @@ function htmlBlockStart(s) {
   }
   if (t.startsWith('<!--')) return { type: 2, end: '-->' };
   if (t.startsWith('<?')) return { type: 3, end: '?>' };
-  if (t.startsWith('<!') && t.length > 2 && /[A-Za-z]/.test(t[2])) return { type: 4, end: '>' };
+  if (t.startsWith('<!') && t.length > 2 && ((t.charCodeAt(2) >= 65 && t.charCodeAt(2) <= 90) || (t.charCodeAt(2) >= 97 && t.charCodeAt(2) <= 122))) return { type: 4, end: '>' };
   if (t.startsWith('<![CDATA[')) return { type: 5, end: ']]>' };
   // tag name
   let j = 0, closing = false;
   if (rest[0] === '/') { closing = true; j = 1; }
-  if (j >= rest.length || !/[A-Za-z]/.test(rest[j])) return null;
+  if (j >= rest.length) return null;
+  const rc0 = rest.charCodeAt(j);
+  if (!((rc0 >= 65 && rc0 <= 90) || (rc0 >= 97 && rc0 <= 122))) return null;
   const nameStart = j;
-  while (j < rest.length && /[A-Za-z0-9-]/.test(rest[j])) j++;
+  while (j < rest.length && LABEL_CH[rest.charCodeAt(j)]) j++;
   const name = rest.slice(nameStart, j).toLowerCase();
   const after = rest[j];
   if (after !== undefined && after !== ' ' && after !== '\t' && after !== '>' && after !== '/') return null;
