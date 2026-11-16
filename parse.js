@@ -452,7 +452,10 @@ function tryLink(s, i, defs, image) {
         for (let q = inner - 2; q >= 0 && text[q] === '\\'; q--) bs2++;
         if (bs2 % 2 === 0) isImage = true;
       }
-      if (!isImage && tryLink(s, i + 1 + inner, defs, false)) return null;
+      // a '[' right after a ']' is a reference label (e.g. the [6] in
+      // ![command][6]), not the start of a nested link
+      if (isImage || (inner > 0 && text[inner - 1] === ']')) continue;
+      if (tryLink(s, i + 1 + inner, defs, false)) return null;
     }
   }
   let j = end + 1;
@@ -582,8 +585,17 @@ function parseEmailAutolink(s, i) {
   let k = j + 1;
   const dstart = k;
   while (k < n && DOMAIN_CH[s.charCodeAt(k)]) k++;
-  // a '_' right after the domain means the word continues: not an email
-  if (k < n && s[k] === '_') return null;
+  // consume _word segments in the domain (e.g. _qux in foo@bar.baz_qux
+  // is part of the address)
+  while (k < n && s[k] === '_' && k + 1 < n && isAlphaNum(s[k + 1])) {
+    k++;
+    while (k < n && (isAlphaNum(s[k]) || s[k] === '.' || s[k] === '-')) k++;
+  }
+  // a '_' right after the domain: a single '_' (e.g. a trailing '_')
+  // means the word continues or the address is invalid, so not an
+  // email. A '__' is a closing emphasis delimiter: the email ends
+  // before it and still links.
+  if (k < n && s[k] === '_' && s[k + 1] !== '_') return null;
   let dom = s.slice(dstart, k);
   // a trailing '.' is a separator left over; a trailing '-' makes the
   // last domain label malformed, so the whole thing is not an email
@@ -623,6 +635,9 @@ function scanAutolinkPath(s, i) {
     if (PATH_CH[s.charCodeAt(k)]) { k++; continue; }
     break;
   }
+  // a trailing ']' is part of the URL (marked keeps it, encoded as %5D
+  // in the href); include one, but do not continue scanning past it
+  if (k < n && s[k] === ']') k++;
   return k;
 }
 
@@ -764,7 +779,10 @@ function parseInline(s, defs, noLink) {
         canClose = rf && (!lf || isUnicodePunct(j < n ? s[j] : ''));
       }
       flush();
-      nodes.push({ d: { ch: c, n: run, canOpen: canOpen, canClose: canClose } });
+      // preWs: the char before the run is whitespace (or start);
+      // postAlpha: the char after the run is alphanumeric. Used by
+      // processEmphasis for marked's outer-pair blocking rule.
+      nodes.push({ d: { ch: c, n: run, canOpen: canOpen, canClose: canClose, preWs: i === 0 || isUnicodeWs(s[i - 1]), postAlpha: j < n && isAlphaNum(s[j]) } });
       i = j; continue;
     }
     if (c === '~') {
@@ -853,6 +871,20 @@ function processEmphasis(nodes) {
       }
       const use = (opener.d.n >= 2 && closer.d.n >= 2) ? 2 : 1;
       // (strikethrough accepts use 1 or 2; both make <del>)
+      // marked quirk: an outer pair does NOT match when it encloses an
+      // inner pair of the same char but a different length whose opener
+      // was space-preceded and whose closer is letter-followed
+      // (e.g. *a **b**c* and **a *b*c** stay literal outside).
+      const oiPos0 = nodes.indexOf(opener);
+      const ciPos0 = nodes.indexOf(closer);
+      if (oiPos0 >= 0 && ciPos0 > oiPos0 && closer.d.ch !== '~') {
+        let blocked = false;
+        for (let k = oiPos0 + 1; k < ciPos0 && !blocked; k++) {
+          const nd = nodes[k];
+          if (nd.blk && nd.blk.ch === closer.d.ch && nd.blk.use !== use && nd.blk.preWs && nd.blk.postAlpha) blocked = true;
+        }
+        if (blocked) { oi--; continue; }
+      }
       // wrap nodes between opener and closer
       const oiPos = nodes.indexOf(opener);
       const ciPos = nodes.indexOf(closer);
@@ -860,7 +892,7 @@ function processEmphasis(nodes) {
       const kids = nodes.slice(oiPos + 1, ciPos);
       let node;
       if (closer.d.ch === '~') node = { s: kids };
-      else node = use === 2 ? { t: kids } : { e: kids };
+      else node = use === 2 ? { t: kids, blk: { ch: closer.d.ch, use: use, preWs: opener.d.preWs, postAlpha: closer.d.postAlpha } } : { e: kids, blk: { ch: closer.d.ch, use: use, preWs: opener.d.preWs, postAlpha: closer.d.postAlpha } };
       nodes.splice(oiPos + 1, ciPos - oiPos - 1, node);
       opener.d.n -= use;
       closer.d.n -= use;
@@ -970,6 +1002,24 @@ function stripIndent(s, n, col0) {
       const w = 4 - ((col0 + col) % 4);
       if (col + w <= n) { col += w; i++; }
       else return ' '.repeat(col + w - n) + s.slice(i + 1);
+    } else break;
+  }
+  return s.slice(i);
+}
+
+// Like stripIndent, but for fenced-code content: a tab straddling the
+// fence-indent boundary is removed entirely (marked behaviour), not
+// partially expanded.
+function stripFenceIndent(s, n, col0) {
+  col0 = col0 || 0;
+  let col = 0, i = 0;
+  while (i < s.length && col < n) {
+    const c = s[i];
+    if (c === ' ') { col++; i++; }
+    else if (c === '\t') {
+      const w = 4 - ((col0 + col) % 4);
+      if (col + w <= n) { col += w; i++; }
+      else return s.slice(i + 1);
     } else break;
   }
   return s.slice(i);
@@ -1383,7 +1433,10 @@ function buildTree(lines, defs, endsWithNL) {
       const failC = stack[d + 1];
       const failIsBq = failC && failC.node && failC.node.t === 'bq';
       const lastWasBlank = tipLeaf && tipLeaf.lines.length > 0 && isBlank(tipLeaf.lines[tipLeaf.lines.length - 1]);
-      if (tipLeaf && tipLeaf.t === 'fcode' && !failIsBq && (isBlank(rest) || !lastWasBlank)) {
+      // the code block must already hold content: a fence that has just
+      // opened (no content lines yet) does not swallow a line that fails
+      // its container; the container (and the empty fence) close instead
+      if (tipLeaf && tipLeaf.t === 'fcode' && !failIsBq && tipLeaf.lines.length > 0 && (isBlank(rest) || !lastWasBlank)) {
         // fall through to the leaf loop with cur = rest
       } else {
         // a fenced block that ends right after a blank line drops that
@@ -1434,7 +1487,7 @@ function buildTree(lines, defs, endsWithNL) {
           if (isClosingFence(cur, leaf.fence)) finalizeLeaf(leaf);
           // up to N spaces of indentation are removed from each content
           // line, where N is the leading fence's indent
-          else leaf.lines.push(stripIndent(cur, leaf.indent || 0, col));
+          else leaf.lines.push(stripFenceIndent(cur, leaf.indent || 0, col));
           handled = true;
         } else if (leaf.t === 'icode') {
           if (isBlank(cur)) { leaf.lines.push(stripIndent(cur, 4, col)); handled = true; }
@@ -1448,11 +1501,13 @@ function buildTree(lines, defs, endsWithNL) {
           } else {
             leaf.lines.push(cur);
             if (leaf.end && cur.toLowerCase().indexOf(leaf.end) >= 0) {
-              // trailing newline unless the next line is blank in this
-              // container's context (or the source ends without one)
+              // trailing newline unless the next line is exactly empty
+              // in this container's context (or the source ends without
+              // one). A whitespace-only next line still leaves the
+              // trailing newline in place.
               const nx = lines[i + 1];
               const st = nx === undefined ? null : stripThrough(nx, stack);
-              leaf.trail = nx === undefined ? endsWithNL : !(st !== null && isBlank(st));
+              leaf.trail = nx === undefined ? endsWithNL : !(st !== null && st === '');
               finalizeLeaf(leaf);
             }
             handled = true;
