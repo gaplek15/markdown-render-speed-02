@@ -872,16 +872,30 @@ function processEmphasis(nodes) {
       const use = (opener.d.n >= 2 && closer.d.n >= 2) ? 2 : 1;
       // (strikethrough accepts use 1 or 2; both make <del>)
       // marked quirk: an outer pair does NOT match when it encloses an
-      // inner pair of the same char but a different length whose opener
-      // was space-preceded and whose closer is letter-followed
+      // inner pair of the same char whose opener was space-preceded and
+      // whose closer is letter-followed, and either the inner/outer
+      // uses differ or the closer is shorter than the opener
       // (e.g. *a **b**c* and **a *b*c** stay literal outside).
+      // The block does not apply when another delimiter of the same char
+      // follows the inner pair inside the outer range
+      // (e.g. **a *b*c*d**).
       const oiPos0 = nodes.indexOf(opener);
       const ciPos0 = nodes.indexOf(closer);
       if (oiPos0 >= 0 && ciPos0 > oiPos0 && closer.d.ch !== '~') {
         let blocked = false;
         for (let k = oiPos0 + 1; k < ciPos0 && !blocked; k++) {
           const nd = nodes[k];
-          if (nd.blk && nd.blk.ch === closer.d.ch && nd.blk.use !== use && nd.blk.preWs && nd.blk.postAlpha) blocked = true;
+          if (nd.blk && nd.blk.ch === closer.d.ch && nd.blk.preWs && nd.blk.postAlpha && closer.d.n === use && (nd.blk.use !== use || closer.d.n < opener.d.n)) {
+            // a later delimiter of a different length unblocks only a
+            // strong (use 2) outer pair, not a single (use 1) one
+            let hasLaterDelim = false;
+            if (use === 2) {
+              for (let m = k + 1; m < ciPos0; m++) {
+                if (nodes[m].d && nodes[m].d.ch === closer.d.ch && nodes[m].d.n !== closer.d.n) { hasLaterDelim = true; break; }
+              }
+            }
+            if (!hasLaterDelim) blocked = true;
+          }
         }
         if (blocked) { oi--; continue; }
       }
@@ -1415,11 +1429,24 @@ function buildTree(lines, defs, endsWithNL) {
     let rest = raw, d = 0, col = 0;
     const rawBlank = isBlank(raw);
     for (let k = 1; k < stack.length; k++) {
-      if (isBlank(rest) && !rawBlank) { d = k; continue; }
-      const r = stack[k].match(rest, col);
-      if (r === null) break;
-      rest = r; d = k;
-      col += stack[k].lastStrip || 0;
+      // a line blank only after stripping a container prefix matches
+      // deeper containers -- except it does not keep a fenced code block
+      // alive: a line lacking the blockquote '>' prefix ends the quote
+      // (and the code block inside it)
+      if (isBlank(rest) && !rawBlank) {
+        const tip = openLeaf(stack[stack.length - 1]);
+        if (tip && tip.t === 'fcode') {
+          const r = stack[k].match(rest, col);
+          if (r === null) break;
+          rest = r; d = k;
+          col += stack[k].lastStrip || 0;
+        } else { d = k; continue; }
+      } else {
+        const r = stack[k].match(rest, col);
+        if (r === null) break;
+        rest = r; d = k;
+        col += stack[k].lastStrip || 0;
+      }
     }
     if (d < stack.length - 1) {
       // a fenced code block swallows its content lines even when they
